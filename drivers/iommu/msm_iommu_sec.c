@@ -286,12 +286,11 @@ irqreturn_t msm_iommu_secure_fault_handler_v2(int irq, void *dev_id)
 	iommu_access_ops->iommu_clk_on(drvdata);
 	tmp = msm_iommu_dump_fault_regs(drvdata->sec_id,
 					ctx_drvdata->num, regs);
-	iommu_access_ops->iommu_clk_off(drvdata);
 
 	if (tmp) {
 		pr_err("%s: Couldn't dump fault registers (%d) %s, ctx: %d\n",
 			__func__, tmp, drvdata->name, ctx_drvdata->num);
-		goto free_regs;
+		goto clock_off;
 	} else {
 		struct msm_iommu_context_reg ctx_regs[MAX_DUMP_REGS];
 		memset(ctx_regs, 0, sizeof(ctx_regs));
@@ -300,7 +299,7 @@ irqreturn_t msm_iommu_secure_fault_handler_v2(int irq, void *dev_id)
 		if (tmp < 0) {
 			ret = IRQ_NONE;
 			pr_err("Incorrect response from secure environment\n");
-			goto free_regs;
+			goto clock_off;
 		}
 
 		if (ctx_regs[DUMP_REG_FSR].val) {
@@ -332,6 +331,8 @@ irqreturn_t msm_iommu_secure_fault_handler_v2(int irq, void *dev_id)
 			ret = IRQ_NONE;
 		}
 	}
+clock_off:
+	iommu_access_ops->iommu_clk_off(drvdata);
 free_regs:
 	kfree(regs);
 lock_release:
@@ -614,8 +615,7 @@ static int msm_iommu_sec_ptbl_map_range(struct msm_iommu_drvdata *iommu_drvdata,
 			return -EINVAL;
 		}
 		while (offset < len) {
-			pa += chunk_offset;
-			pa_list[cnt] = pa;
+			pa_list[cnt] = pa + chunk_offset;
 			chunk_offset += SZ_1M;
 			offset += SZ_1M;
 			cnt++;
@@ -872,8 +872,8 @@ fail:
 	return len;
 }
 
-static int msm_iommu_map_range(struct iommu_domain *domain, unsigned int va,
-			       struct scatterlist *sg, unsigned int len,
+static int msm_iommu_map_range(struct iommu_domain *domain, unsigned long va,
+			       struct scatterlist *sg, size_t len,
 			       int prot)
 {
 	int ret;
@@ -894,9 +894,30 @@ fail:
 	return ret;
 }
 
+static size_t msm_iommu_map_sg(struct iommu_domain *domain, unsigned long va,
+				struct scatterlist *sg, unsigned int nr_entries,
+				int prot)
+{
+	int ret, i;
+	struct scatterlist *tmp;
+	unsigned long len = 0;
 
-static int msm_iommu_unmap_range(struct iommu_domain *domain, unsigned int va,
-				 unsigned int len)
+	/*
+	 * Longer term work: convert over to generic page table management
+	 * which means we can work on scattergather lists and the whole range
+	 */
+	for_each_sg(sg, tmp, nr_entries, i)
+		len += tmp->length;
+
+	ret = msm_iommu_map_range(domain, va, sg, len, prot);
+	if (ret)
+		return 0;
+	else
+		return len;
+}
+
+static int msm_iommu_unmap_range(struct iommu_domain *domain, unsigned long va,
+				 size_t len)
 {
 	struct msm_iommu_drvdata *iommu_drvdata;
 	struct msm_iommu_ctx_drvdata *ctx_drvdata;
@@ -971,6 +992,7 @@ static struct iommu_ops msm_iommu_ops = {
 	.map = msm_iommu_map,
 	.unmap = msm_iommu_unmap,
 	.map_range = msm_iommu_map_range,
+	.map_sg = msm_iommu_map_sg,
 	.unmap_range = msm_iommu_unmap_range,
 	.iova_to_phys = msm_iommu_iova_to_phys,
 	.domain_has_cap = msm_iommu_domain_has_cap,

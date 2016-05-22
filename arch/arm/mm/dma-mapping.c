@@ -160,6 +160,8 @@ static void arm_dma_unremap(struct device *dev, void *remapped_addr,
 		return;
 	}
 	vunmap(remapped_addr);
+	flush_tlb_kernel_range((unsigned long)remapped_addr,
+				(unsigned long)(remapped_addr + size));
 }
 
 struct dma_map_ops arm_dma_ops = {
@@ -1480,11 +1482,18 @@ static int arm_iommu_mmap_attrs(struct device *dev, struct vm_area_struct *vma,
 	unsigned long uaddr = vma->vm_start;
 	unsigned long usize = vma->vm_end - vma->vm_start;
 	struct page **pages = __iommu_get_pages(cpu_addr, attrs);
+	unsigned long nr_pages = PAGE_ALIGN(size) >> PAGE_SHIFT;
+	unsigned long off = vma->vm_pgoff;
 
 	vma->vm_page_prot = __get_dma_pgprot(attrs, vma->vm_page_prot);
 
 	if (!pages)
 		return -ENXIO;
+
+	if (off >= nr_pages || (usize >> PAGE_SHIFT) > nr_pages - off)
+		return -ENXIO;
+
+	pages += off;
 
 	do {
 		int ret = vm_insert_page(vma, uaddr, *pages++);
@@ -1689,7 +1698,31 @@ int arm_coherent_iommu_map_sg(struct device *dev, struct scatterlist *sg,
 int arm_iommu_map_sg(struct device *dev, struct scatterlist *sg,
 		int nents, enum dma_data_direction dir, struct dma_attrs *attrs)
 {
-	return __iommu_map_sg(dev, sg, nents, dir, attrs, false);
+	struct scatterlist *s;
+	int i;
+	size_t ret;
+	struct dma_iommu_mapping *mapping = dev->archdata.mapping;
+	unsigned int total_length = 0, current_offset = 0;
+	dma_addr_t iova;
+	int prot = __dma_direction_to_prot(dir);
+
+	for_each_sg(sg, s, nents, i)
+		total_length += s->length;
+
+	iova = __alloc_iova(mapping, total_length);
+	ret = iommu_map_sg(mapping->domain, iova, sg, nents, prot);
+	if (ret != total_length) {
+		__free_iova(mapping, iova, total_length);
+		return 0;
+	}
+
+	for_each_sg(sg, s, nents, i) {
+		s->dma_address = iova + current_offset;
+		s->dma_length = total_length - current_offset;
+		current_offset += s->length;
+	}
+
+	return nents;
 }
 
 static void __iommu_unmap_sg(struct device *dev, struct scatterlist *sg,
@@ -1739,7 +1772,15 @@ void arm_coherent_iommu_unmap_sg(struct device *dev, struct scatterlist *sg,
 void arm_iommu_unmap_sg(struct device *dev, struct scatterlist *sg, int nents,
 			enum dma_data_direction dir, struct dma_attrs *attrs)
 {
-	__iommu_unmap_sg(dev, sg, nents, dir, attrs, false);
+	struct dma_iommu_mapping *mapping = dev->archdata.mapping;
+	unsigned int total_length = sg_dma_len(sg);
+	dma_addr_t iova = sg_dma_address(sg);
+
+	total_length = PAGE_ALIGN((iova & ~PAGE_MASK) + total_length);
+	iova &= PAGE_MASK;
+
+	iommu_unmap_range(mapping->domain, iova, total_length);
+	__free_iova(mapping, iova, total_length);
 }
 
 /**
