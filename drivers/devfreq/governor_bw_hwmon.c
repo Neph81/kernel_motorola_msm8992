@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -662,6 +662,47 @@ static int devfreq_bw_hwmon_get_freq(struct devfreq *df,
 	return 0;
 }
 
+static ssize_t store_throttle_adj(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct devfreq *df = to_devfreq(dev);
+	struct hwmon_node *node = df->data;
+	int ret;
+	unsigned int val;
+
+	if (!node->hw->set_throttle_adj)
+		return -ENOSYS;
+
+	ret = kstrtouint(buf, 10, &val);
+	if (ret)
+		return ret;
+
+	ret = node->hw->set_throttle_adj(node->hw, val);
+
+	if (!ret)
+		return count;
+	else
+		return ret;
+}
+
+static ssize_t show_throttle_adj(struct device *dev,
+			struct device_attribute *attr, char *buf)
+{
+	struct devfreq *df = to_devfreq(dev);
+	struct hwmon_node *node = df->data;
+	unsigned int val;
+
+	if (!node->hw->get_throttle_adj)
+		val = 0;
+	else
+		val = node->hw->get_throttle_adj(node->hw);
+
+	return snprintf(buf, PAGE_SIZE, "%u\n", val);
+}
+
+static DEVICE_ATTR(throttle_adj, 0644, show_throttle_adj,
+						store_throttle_adj);
+
 gov_attr(guard_band_mbps, 0U, 2000U);
 gov_attr(decay_rate, 0U, 100U);
 gov_attr(io_percent, 1U, 100U);
@@ -698,6 +739,7 @@ static struct attribute *dev_attr[] = {
 	&dev_attr_low_power_io_percent.attr,
 	&dev_attr_low_power_delay.attr,
 	&dev_attr_mbps_zones.attr,
+	&dev_attr_throttle_adj.attr,
 	NULL,
 };
 
@@ -711,6 +753,8 @@ static int devfreq_bw_hwmon_ev_handler(struct devfreq *df,
 {
 	int ret;
 	unsigned int sample_ms;
+	struct hwmon_node *node;
+	struct bw_hwmon *hw;
 
 	switch (event) {
 	case DEVFREQ_GOV_START:
@@ -737,7 +781,22 @@ static int devfreq_bw_hwmon_ev_handler(struct devfreq *df,
 		sample_ms = *(unsigned int *)data;
 		sample_ms = max(MIN_MS, sample_ms);
 		sample_ms = min(MAX_MS, sample_ms);
+		/*
+		 * Suspend/resume the HW monitor around the interval update
+		 * to prevent the HW monitor IRQ from trying to change
+		 * stop/start the delayed workqueue while the interval update
+		 * is happening.
+		 */
+		node = df->data;
+		hw = node->hw;
+		hw->suspend_hwmon(hw);
 		devfreq_interval_update(df, &sample_ms);
+		ret = hw->resume_hwmon(hw);
+		if (ret) {
+			dev_err(df->dev.parent,
+				"Unable to resume HW monitor (%d)\n", ret);
+			return ret;
+		}
 		break;
 
 	case DEVFREQ_GOV_SUSPEND:

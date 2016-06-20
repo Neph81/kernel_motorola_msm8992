@@ -1416,8 +1416,15 @@ static int msm_compr_trigger(struct snd_compr_stream *cstream, int cmd)
 		}
 		if (atomic_read(&prtd->eos)) {
 			pr_debug("%s: interrupt eos wait queues", __func__);
-			prtd->cmd_interrupt = 1;
-			wake_up(&prtd->eos_wait);
+			/*
+			 * Gapless playback does not wait for eos, do not set
+			 * cmd_int and do not wake up eos_wait during gapless
+			 * transition
+			 */
+			if (!prtd->gapless_state.gapless_transition) {
+				prtd->cmd_interrupt = 1;
+				wake_up(&prtd->eos_wait);
+			}
 			atomic_set(&prtd->eos, 0);
 		}
 		if (atomic_read(&prtd->drain)) {
@@ -2658,7 +2665,7 @@ static int msm_compr_audio_effects_config_info(struct snd_kcontrol *kcontrol,
 					       struct snd_ctl_elem_info *uinfo)
 {
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
-	uinfo->count = 128;
+	uinfo->count = MAX_PP_PARAMS_SZ;
 	uinfo->value.integer.min = 0;
 	uinfo->value.integer.max = 0xFFFFFFFF;
 	return 0;

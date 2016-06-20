@@ -1269,9 +1269,7 @@ static inline u64 scale_exec_time(u64 delta, struct rq *rq)
 	unsigned int cur_freq = rq->cur_freq;
 	int sf;
 
-	if (unlikely(cur_freq > max_possible_freq ||
-		     (cur_freq == rq->max_freq &&
-		      rq->max_freq < rq->max_possible_freq)))
+	if (unlikely(cur_freq > max_possible_freq))
 		cur_freq = rq->max_possible_freq;
 
 	/* round up div64 */
@@ -2584,6 +2582,27 @@ static int compute_load_scale_factor(int cpu)
 	return load_scale;
 }
 
+#define sched_up_down_migrate_auto_update 1
+static void check_for_up_down_migrate_update(const struct cpumask *cpus)
+{
+	int i = cpumask_first(cpus);
+	struct rq *rq = cpu_rq(i);
+
+	if (!sched_up_down_migrate_auto_update)
+		return;
+
+	if (rq->max_possible_capacity == max_possible_capacity)
+		return;
+
+	if (rq->max_possible_freq == rq->max_freq)
+		up_down_migrate_scale_factor = 1024;
+	else
+		up_down_migrate_scale_factor = (1024 * rq->max_possible_freq)/
+					rq->max_freq;
+
+	update_up_down_migrate();
+}
+
 static int cpufreq_notifier_policy(struct notifier_block *nb,
 		unsigned long val, void *data)
 {
@@ -2690,6 +2709,7 @@ static int cpufreq_notifier_policy(struct notifier_block *nb,
 	}
 
 	__update_min_max_capacity();
+	check_for_up_down_migrate_update(policy->related_cpus);
 	post_big_small_task_count_change(cpu_possible_mask);
 
 	return 0;
@@ -7448,6 +7468,7 @@ migration_call(struct notifier_block *nfb, unsigned long action, void *hcpu)
 		set_window_start(rq);
 		raw_spin_unlock_irqrestore(&rq->lock, flags);
 		rq->calc_load_update = calc_load_update;
+		account_reset_rq(rq);
 		break;
 
 	case CPU_ONLINE:

@@ -595,11 +595,17 @@ typedef struct {
 	u_int32_t ibssPs1RxChainInAtimEnable;
 }ibss_power_save_params;
 
+struct wma_runtime_pm_context {
+	void *ap;
+	void *resume;
+};
+
 typedef struct {
 	void *wmi_handle;
 	void *htc_handle;
 	void *vos_context;
 	void *mac_context;
+	void *runtime_pm_ctx;
 
 	vos_event_t wma_ready_event;
 	vos_event_t wma_resume_event;
@@ -787,6 +793,8 @@ typedef struct {
 
 	uint32_t wow_wakeup_enable_mask;
 	uint32_t wow_wakeup_disable_mask;
+
+	struct wma_runtime_pm_context runtime_context;
 }t_wma_handle, *tp_wma_handle;
 
 struct wma_target_cap {
@@ -1586,7 +1594,13 @@ A_UINT32 eCsrAuthType_to_rsn_authmode (eCsrAuthType authtype,
                                        eCsrEncryptionType encr);
 A_UINT32 eCsrEncryptionType_to_rsn_cipherset (eCsrEncryptionType encr);
 
-#define WMA_TGT_INVALID_SNR (-1)
+/*
+ * The firmware value has been changed recently to 0x127
+ * But, to maintain backward compatibility, the old
+ * value is also preserved.
+ */
+#define WMA_TGT_INVALID_SNR_OLD (-1)
+#define WMA_TGT_INVALID_SNR_NEW 0x127
 
 #define WMA_TX_Q_RECHECK_TIMER_WAIT      2    // 2 ms
 #define WMA_TX_Q_RECHECK_TIMER_MAX_WAIT  20   // 20 ms

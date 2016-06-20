@@ -103,6 +103,7 @@ module_param_named(
 static int msm_pm_sleep_time_override;
 module_param_named(sleep_time_override,
 	msm_pm_sleep_time_override, int, S_IRUGO | S_IWUSR | S_IWGRP);
+static uint64_t suspend_wake_time;
 
 static bool print_parsed_dt;
 module_param_named(
@@ -117,6 +118,21 @@ s32 msm_cpuidle_get_deep_idle_latency(void)
 {
 	return 10;
 }
+
+void lpm_suspend_wake_time(uint64_t wakeup_time)
+{
+	if (wakeup_time <= 0) {
+		suspend_wake_time = msm_pm_sleep_time_override;
+		return;
+	}
+
+	if (msm_pm_sleep_time_override &&
+		(msm_pm_sleep_time_override < wakeup_time))
+		suspend_wake_time = msm_pm_sleep_time_override;
+	else
+		suspend_wake_time = wakeup_time;
+}
+EXPORT_SYMBOL(lpm_suspend_wake_time);
 
 static void update_debug_pc_event(enum debug_event event, uint32_t arg1,
 		uint32_t arg2, uint32_t arg3, uint32_t arg4)
@@ -217,8 +233,11 @@ int set_l2_mode(struct low_power_ops *ops, int mode, bool notify_rpm)
 		lpm = MSM_SPM_MODE_DISABLED;
 		break;
 	}
-	rc = msm_spm_config_low_power_mode(ops->spm, lpm, notify_rpm);
+	/* Do not program L2 SPM. This will be set by TZ */
+	if (lpm_wa_get_skip_l2_spm())
+		return 0;
 
+	rc = msm_spm_config_low_power_mode(ops->spm, lpm, notify_rpm);
 	if (rc)
 		pr_err("%s: Failed to set L2 low power mode %d, ERR %d",
 				__func__, lpm, rc);
@@ -276,6 +295,9 @@ static int cpu_power_select(struct cpuidle_device *dev,
 
 		lvl_overhead_energy = pwr_params->energy_overhead;
 
+		if (i > 0 && suspend_in_progress)
+			continue;
+
 		if (latency_us < lvl_latency_us)
 			continue;
 
@@ -320,6 +342,8 @@ static int cpu_power_select(struct cpuidle_device *dev,
 	if (modified_time_us)
 		msm_pm_set_timer(modified_time_us);
 
+	trace_cpu_power_select(best_level, sleep_us, latency_us, next_event_us);
+
 	return best_level;
 }
 
@@ -333,18 +357,19 @@ static uint64_t get_cluster_sleep_time(struct lpm_cluster *cluster,
 	struct cpumask online_cpus_in_cluster;
 
 	next_event.tv64 = KTIME_MAX;
-
+	if (!suspend_wake_time)
+		suspend_wake_time =  msm_pm_sleep_time_override;
 	if (!from_idle) {
 		if (mask)
 			cpumask_copy(mask, cpumask_of(raw_smp_processor_id()));
-		if (!msm_pm_sleep_time_override)
+		if (!suspend_wake_time)
 			return ~0ULL;
 		else
-			return USEC_PER_SEC * msm_pm_sleep_time_override;
+			return USEC_PER_SEC * suspend_wake_time;
 	}
 
-	BUG_ON(!cpumask_and(&online_cpus_in_cluster,
-			&cluster->num_childs_in_sync, cpu_online_mask));
+	cpumask_and(&online_cpus_in_cluster,
+			&cluster->num_childs_in_sync, cpu_online_mask);
 
 	for_each_cpu(cpu, &online_cpus_in_cluster) {
 		td = &per_cpu(tick_cpu_device, cpu);
@@ -478,19 +503,20 @@ static int cluster_configure(struct lpm_cluster *cluster, int idx,
 			cpu_cluster_pm_enter(cluster->aff_level);
 	}
 	if (level->notify_rpm) {
-		struct cpumask nextcpu;
+		struct cpumask nextcpu, *cpumask;
 		uint32_t us;
 
 		us = get_cluster_sleep_time(cluster, &nextcpu, from_idle);
+		cpumask = level->disable_dynamic_routing ? NULL : &nextcpu;
 
-		ret = msm_rpm_enter_sleep(0, &nextcpu);
+		ret = msm_rpm_enter_sleep(0, cpumask);
 		if (ret) {
 			pr_info("Failed msm_rpm_enter_sleep() rc = %d\n", ret);
 			goto failed_set_mode;
 		}
 
 		do_div(us, USEC_PER_SEC/SCLK_HZ);
-		msm_mpm_enter_sleep((uint32_t)us, from_idle, &nextcpu);
+		msm_mpm_enter_sleep((uint32_t)us, from_idle, cpumask);
 	}
 	cluster->last_level = idx;
 	spin_unlock(&cluster->sync_lock);
@@ -594,13 +620,6 @@ static void cluster_unprepare(struct lpm_cluster *cluster,
 	level = &cluster->levels[cluster->last_level];
 	if (level->notify_rpm) {
 		msm_rpm_exit_sleep();
-
-		/* If RPM bumps up CX to turbo, unvote CX turbo vote
-		 * during exit of rpm assisted power collapse to
-		 * reduce the power impact
-		 */
-
-		lpm_wa_cx_unvote_send();
 		msm_mpm_exit_sleep(from_idle);
 	}
 
@@ -700,14 +719,20 @@ static int lpm_cpuidle_enter(struct cpuidle_device *dev,
 	sched_set_cpu_cstate(smp_processor_id(), idx + 1,
 		pwr_params->energy_overhead, pwr_params->latency_us);
 
+	trace_cpu_idle_enter(idx);
 	cpu_prepare(cluster, idx, true);
 
 	cluster_prepare(cluster, cpumask, idx, true);
-	trace_cpu_idle_enter(idx);
 	lpm_stats_cpu_enter(idx);
-	success = msm_cpu_pm_enter_sleep(cluster->cpu->levels[idx].mode, true);
+	if (idx > 0)
+		update_debug_pc_event(CPU_ENTER, idx, 0xdeaffeed, 0xdeaffeed,
+					true);
+	success = msm_cpu_pm_enter_sleep(cluster->cpu->levels[idx].mode,
+						true);
+	if (idx > 0)
+		update_debug_pc_event(CPU_EXIT, idx, success, 0xdeaffeed,
+					true);
 	lpm_stats_cpu_exit(idx, success);
-	trace_cpu_idle_exit(idx, success);
 	cluster_unprepare(cluster, cpumask, idx, true);
 	cpu_unprepare(cluster, idx, true);
 
@@ -716,10 +741,11 @@ static int lpm_cpuidle_enter(struct cpuidle_device *dev,
 	time = ktime_to_ns(ktime_get()) - time;
 	do_div(time, 1000);
 	dev->last_residency = (int)time;
+	trace_cpu_idle_exit(idx, success);
 
 exit:
-	local_irq_enable();
 	trace_cpu_idle_rcuidle(PWR_EVENT_EXIT, dev->cpu);
+	local_irq_enable();
 	return idx;
 }
 
@@ -891,7 +917,7 @@ static int lpm_suspend_prepare(void)
 	return 0;
 }
 
-static void lpm_suspend_wake(void)
+static void lpm_suspend_end(void)
 {
 	suspend_in_progress = false;
 	msm_mpm_suspend_wake();
@@ -918,7 +944,13 @@ static int lpm_suspend_enter(suspend_state_t state)
 	}
 	cpu_prepare(cluster, idx, false);
 	cluster_prepare(cluster, cpumask, idx, false);
+	if (idx > 0)
+		update_debug_pc_event(CPU_ENTER, idx, 0xdeaffeed,
+					0xdeaffeed, false);
 	msm_cpu_pm_enter_sleep(cluster->cpu->levels[idx].mode, false);
+	if (idx > 0)
+		update_debug_pc_event(CPU_EXIT, idx, true, 0xdeaffeed,
+					false);
 	cluster_unprepare(cluster, cpumask, idx, false);
 	cpu_unprepare(cluster, idx, false);
 	return 0;
@@ -928,7 +960,7 @@ static const struct platform_suspend_ops lpm_suspend_ops = {
 	.enter = lpm_suspend_enter,
 	.valid = suspend_valid_only_mem,
 	.prepare_late = lpm_suspend_prepare,
-	.wake = lpm_suspend_wake,
+	.end = lpm_suspend_end,
 	.suspend_again = quickwakeup_suspend_again,
 };
 

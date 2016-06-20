@@ -1352,6 +1352,14 @@ static int __read_mostly sched_upmigrate_min_nice = 15;
 int __read_mostly sysctl_sched_upmigrate_min_nice = 15;
 
 /*
+ * The load scale factor of a CPU gets boosted when its max frequency
+ * is restricted due to which the tasks are migrating to higher capacity
+ * CPUs early. The sched_upmigrate threshold is auto-upgraded by
+ * rq->max_possible_freq/rq->max_freq of a lower capacity CPU.
+ */
+unsigned int up_down_migrate_scale_factor = 1024;
+
+/*
  * Scheduler boost is a mechanism to temporarily place tasks on CPUs
  * with higher capacity than those where a task would have normally
  * ended up with their load characteristics. Any entity enabling
@@ -1366,6 +1374,35 @@ static inline int available_cpu_capacity(int cpu)
 	return rq->capacity;
 }
 
+void update_up_down_migrate(void)
+{
+	unsigned int up_migrate = pct_to_real(sysctl_sched_upmigrate_pct);
+	unsigned int down_migrate = pct_to_real(sysctl_sched_downmigrate_pct);
+	unsigned int delta;
+
+	if (up_down_migrate_scale_factor == 1024)
+		goto done;
+
+	delta = up_migrate - down_migrate;
+
+	up_migrate /= NSEC_PER_USEC;
+	up_migrate *= up_down_migrate_scale_factor;
+	up_migrate >>= 10;
+	up_migrate *= NSEC_PER_USEC;
+
+	up_migrate = min(up_migrate, sched_ravg_window);
+
+	down_migrate /= NSEC_PER_USEC;
+	down_migrate *= up_down_migrate_scale_factor;
+	down_migrate >>= 10;
+	down_migrate *= NSEC_PER_USEC;
+
+	down_migrate = min(down_migrate, up_migrate - delta);
+done:
+	sched_upmigrate = up_migrate;
+	sched_downmigrate = down_migrate;
+}
+
 void set_hmp_defaults(void)
 {
 	sched_spill_load =
@@ -1374,11 +1411,7 @@ void set_hmp_defaults(void)
 	sched_small_task =
 		pct_to_real(sysctl_sched_small_task_pct);
 
-	sched_upmigrate =
-		pct_to_real(sysctl_sched_upmigrate_pct);
-
-	sched_downmigrate =
-		pct_to_real(sysctl_sched_downmigrate_pct);
+	update_up_down_migrate();
 
 #ifdef CONFIG_SCHED_FREQ_INPUT
 	sched_heavy_task =
@@ -2052,7 +2085,7 @@ static int select_best_cpu(struct task_struct *p, int target, int reason,
 		sync = 0;
 	}
 
-	if (small_task && !boost) {
+	if (small_task && !boost && !sync) {
 		best_cpu = best_small_task_cpu(p, sync);
 		prefer_idle = 0;	/* For sched_task_load tracepoint */
 		goto done;
@@ -2060,6 +2093,14 @@ static int select_best_cpu(struct task_struct *p, int target, int reason,
 
 	trq = task_rq(p);
 	cpumask_and(&search_cpus, tsk_cpus_allowed(p), cpu_online_mask);
+	if (sync) {
+		unsigned int cpuid = smp_processor_id();
+		if (cpumask_test_cpu(cpuid, &search_cpus)) {
+			best_cpu = cpuid;
+			goto done;
+		}
+	}
+
 	for_each_cpu(i, &search_cpus) {
 		struct rq *rq = cpu_rq(i);
 
@@ -2970,7 +3011,7 @@ void init_new_task_load(struct task_struct *p)
 	u32 init_load_pelt = sched_init_task_load_pelt;
 	u32 init_load_pct = current->init_load_pct;
 
-	/* Note: child's init_load_pct itself would be 0 */
+	p->init_load_pct = 0;
 	memset(&p->ravg, 0, sizeof(struct ravg));
 	p->se.avg.decay_count	= 0;
 
@@ -3272,13 +3313,13 @@ static inline void update_entity_load_avg(struct sched_entity *se,
 	 */
 	if (entity_is_task(se)) {
 		now = cfs_rq_clock_task(cfs_rq);
-		if (se->on_rq)
+		if (sched_use_pelt && se->on_rq)
 			dec_hmp_sched_stats_fair(rq_of(cfs_rq), task_of(se));
 	} else
 		now = cfs_rq_clock_task(group_cfs_rq(se));
 
 	decayed = __update_entity_runnable_avg(cpu, now, &se->avg, se->on_rq);
-	if (entity_is_task(se) && se->on_rq)
+	if (sched_use_pelt && entity_is_task(se) && se->on_rq)
 		inc_hmp_sched_stats_fair(rq_of(cfs_rq), task_of(se));
 
 	if (!decayed)
@@ -3682,25 +3723,17 @@ static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
 static void
 enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
-	bool renorm = !(flags & ENQUEUE_WAKEUP) || (flags & ENQUEUE_WAKING);
-	bool curr = cfs_rq->curr == se;
-
 	/*
-	 * If we're the current task, we must renormalise before calling
-	 * update_curr().
+	 * Update the normalized vruntime before updating min_vruntime
+	 * through callig update_curr().
 	 */
-	if (renorm && curr)
+	if (!(flags & ENQUEUE_WAKEUP) || (flags & ENQUEUE_WAKING))
 		se->vruntime += cfs_rq->min_vruntime;
 
+	/*
+	 * Update run-time statistics of the 'current'.
+	 */
 	update_curr(cfs_rq);
-
-	/*
-	 * Otherwise, renormalise after, such that we're placed at the current
-	 * moment in time, instead of some random moment in the past.
-	 */
-	if (renorm && !curr)
-		se->vruntime += cfs_rq->min_vruntime;
-
 	enqueue_entity_load_avg(cfs_rq, se, flags & ENQUEUE_WAKEUP);
 	account_entity_enqueue(cfs_rq, se);
 	update_cfs_shares(cfs_rq);
@@ -3712,7 +3745,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	update_stats_enqueue(cfs_rq, se);
 	check_spread(cfs_rq, se);
-	if (!curr)
+	if (se != cfs_rq->curr)
 		__enqueue_entity(cfs_rq, se);
 	se->on_rq = 1;
 

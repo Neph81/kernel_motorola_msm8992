@@ -893,7 +893,8 @@ void wmi_control_rx(void *ctx, HTC_PACKET *htc_packet)
 	id = WMI_GET_FIELD(adf_nbuf_data(evt_buf), WMI_CMD_HDR, COMMANDID);
 	/* TX_PAUSE EVENT should be handled with tasklet context */
 	if ((WMI_TX_PAUSE_EVENTID == id) ||
-		(WMI_WOW_WAKEUP_HOST_EVENTID == id)) {
+		(WMI_WOW_WAKEUP_HOST_EVENTID == id) ||
+		(WMI_D0_WOW_DISABLE_ACK_EVENTID == id)) {
 		if (adf_nbuf_pull_head(evt_buf, sizeof(WMI_CMD_HDR)) == NULL)
 			return;
 
@@ -904,11 +905,9 @@ void wmi_control_rx(void *ctx, HTC_PACKET *htc_packet)
 					data, len, id,
 					&wmi_cmd_struct_ptr);
 		if (tlv_ok_status != 0) {
-			if (tlv_ok_status == 1) {
-				wmi_cmd_struct_ptr = data;
-			} else {
-				return;
-			}
+			WMA_LOGE("Error: id=0x%x, wmitlv_check_and_pad_tlvs ret=%d",
+				id, tlv_ok_status);
+			return;
 		}
 
 		idx = wmi_unified_get_event_handler_ix(wmi_handle, id);

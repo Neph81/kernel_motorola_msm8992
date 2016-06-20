@@ -95,7 +95,7 @@ struct eth_dev {
 	struct list_head	tx_reqs, rx_reqs;
 	unsigned		tx_qlen;
 /* Minimum number of TX USB request queued to UDC */
-#define TX_REQ_THRESHOLD	5
+#define MAX_TX_REQ_WITH_NO_INT	5
 	int			no_tx_req_used;
 	int			tx_skb_hold_count;
 	u32			tx_req_bufsize;
@@ -130,9 +130,9 @@ struct eth_dev {
 	unsigned long		rx_throttle;
 	unsigned int		tx_aggr_cnt[DL_MAX_PKTS_PER_XFER];
 	unsigned int		tx_pkts_rcvd;
+	unsigned int		tx_bytes_rcvd;
 	unsigned int		loop_brk_cnt;
 	struct dentry		*uether_dent;
-	struct dentry		*uether_dfile;
 
 	enum ifc_state		state;
 	struct notifier_block	cpufreq_notifier;
@@ -309,7 +309,7 @@ rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags)
 	size_t		size = 0;
 	struct usb_ep	*out;
 	unsigned long	flags;
-	unsigned short reserve_headroom;
+	unsigned short reserve_headroom = 0;
 
 	spin_lock_irqsave(&dev->lock, flags);
 	if (dev->port_usb)
@@ -348,9 +348,7 @@ rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags)
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	if (dev->rx_needed_headroom)
-		reserve_headroom = dev->rx_needed_headroom;
-	else
-		reserve_headroom = NET_IP_ALIGN;
+		reserve_headroom = ALIGN(dev->rx_needed_headroom, 4);
 
 	pr_debug("%s: size: %zu + %d(hr)", __func__, size, reserve_headroom);
 
@@ -394,7 +392,6 @@ static void rx_complete(struct usb_ep *ep, struct usb_request *req)
 	/* normal completion */
 	case 0:
 		skb_put(skb, req->actual);
-
 		if (dev->unwrap) {
 			unsigned long	flags;
 
@@ -706,6 +703,15 @@ static void tx_complete(struct usb_ep *ep, struct usb_request *req)
 	case -ESHUTDOWN:		/* disconnect etc */
 		break;
 	case 0:
+		/*
+		 * Remove the header length, before updating tx_bytes in
+		 * net->stats, since when packet is received from network layer
+		 * this header is not added. So this will now give the exact
+		 * number of bytes sent to the host.
+		 */
+		if (req->num_sgs)
+			req->actual -= (req->num_sgs/2) * dev->header_len;
+
 		if (!req->zero)
 			dev->net->stats.tx_bytes += req->actual-1;
 		else
@@ -725,12 +731,12 @@ static void tx_complete(struct usb_ep *ep, struct usb_request *req)
 	dev->net->stats.tx_packets += n;
 
 	spin_lock(&dev->req_lock);
-	list_add_tail(&req->list, &dev->tx_reqs);
 
 	if (req->num_sgs) {
 		if (!req->status)
 			queue_work(uether_tx_wq, &dev->tx_work);
 
+		list_add_tail(&req->list, &dev->tx_reqs);
 		spin_unlock(&dev->req_lock);
 		return;
 	}
@@ -740,7 +746,8 @@ static void tx_complete(struct usb_ep *ep, struct usb_request *req)
 		req->length = 0;
 		in = dev->port_usb->in_ep;
 
-		if (!list_empty(&dev->tx_reqs)) {
+		/* Do not process further if no_interrupt is set */
+		if (!req->no_interrupt && !list_empty(&dev->tx_reqs)) {
 			new_req = container_of(dev->tx_reqs.next,
 					struct usb_request, list);
 			list_del(&new_req->list);
@@ -768,6 +775,16 @@ static void tx_complete(struct usb_ep *ep, struct usb_request *req)
 					length++;
 				}
 
+				/* set when tx completion interrupt needed */
+				spin_lock(&dev->req_lock);
+				dev->tx_qlen++;
+				if (dev->tx_qlen == MAX_TX_REQ_WITH_NO_INT) {
+					new_req->no_interrupt = 0;
+					dev->tx_qlen = 0;
+				} else {
+					new_req->no_interrupt = 1;
+				}
+				spin_unlock(&dev->req_lock);
 				new_req->length = length;
 				new_req->complete = tx_complete;
 				retval = usb_ep_queue(in, new_req, GFP_ATOMIC);
@@ -813,6 +830,11 @@ static void tx_complete(struct usb_ep *ep, struct usb_request *req)
 		spin_unlock(&dev->req_lock);
 		dev_kfree_skb_any(skb);
 	}
+
+	/* put the completed req back to tx_reqs tail pool */
+	spin_lock(&dev->req_lock);
+	list_add_tail(&req->list, &dev->tx_reqs);
+	spin_unlock(&dev->req_lock);
 
 	if (netif_carrier_ok(dev->net))
 		netif_wake_queue(dev->net);
@@ -1053,6 +1075,7 @@ static netdev_tx_t eth_start_xmit(struct sk_buff *skb,
 	}
 
 	dev->tx_pkts_rcvd++;
+	dev->tx_bytes_rcvd += skb->len;
 	if (dev->sg_enabled) {
 		skb_queue_tail(&dev->tx_skb_q, skb);
 		if (dev->tx_skb_q.qlen > tx_stop_threshold) {
@@ -1138,7 +1161,14 @@ static netdev_tx_t eth_start_xmit(struct sk_buff *skb,
 		spin_lock_irqsave(&dev->req_lock, flags);
 		dev->tx_skb_hold_count++;
 		if (dev->tx_skb_hold_count < dev->dl_max_pkts_per_xfer) {
-			if (dev->no_tx_req_used > TX_REQ_THRESHOLD) {
+
+			/*
+			 * should allow aggregation only, if the number of
+			 * requests queued more than the tx requests that can
+			 *  be queued with no interrupt flag set sequentially.
+			 * Otherwise, packets may be blocked forever.
+			 */
+			if (dev->no_tx_req_used > MAX_TX_REQ_WITH_NO_INT) {
 				list_add(&req->list, &dev->tx_reqs);
 				spin_unlock_irqrestore(&dev->req_lock, flags);
 				goto success;
@@ -1177,13 +1207,15 @@ static netdev_tx_t eth_start_xmit(struct sk_buff *skb,
 	if (gadget_is_dualspeed(dev->gadget) &&
 		 (dev->gadget->speed == USB_SPEED_HIGH ||
 		  dev->gadget->speed == USB_SPEED_SUPER)) {
+		spin_lock_irqsave(&dev->req_lock, flags);
 		dev->tx_qlen++;
-		if (dev->tx_qlen == (qmult/2)) {
+		if (dev->tx_qlen == MAX_TX_REQ_WITH_NO_INT) {
 			req->no_interrupt = 0;
 			dev->tx_qlen = 0;
 		} else {
 			req->no_interrupt = 1;
 		}
+		spin_unlock_irqrestore(&dev->req_lock, flags);
 	} else {
 		req->no_interrupt = 0;
 	}
@@ -2001,6 +2033,38 @@ const struct file_operations uether_stats_ops = {
 	.write = uether_stat_reset,
 };
 
+static int uether_bytes_rcvd_show(struct seq_file *s, void *unused)
+{
+	struct eth_dev *dev = s->private;
+
+	if (dev)
+		seq_printf(s, "%u\n", dev->tx_bytes_rcvd);
+
+	return 0;
+}
+
+static int uether_bytes_rcvd_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, uether_bytes_rcvd_show, inode->i_private);
+}
+
+static ssize_t uether_bytes_rcvd_reset(struct file *file,
+		const char __user *ubuf, size_t count, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct eth_dev *dev = s->private;
+
+	dev->tx_bytes_rcvd = 0;
+
+	return count;
+}
+
+const struct file_operations uether_bytes_rcvd_ops = {
+	.open = uether_bytes_rcvd_open,
+	.read = seq_read,
+	.write = uether_bytes_rcvd_reset,
+};
+
 static void uether_debugfs_init(struct eth_dev *dev, const char *name)
 {
 	struct dentry *uether_dent;
@@ -2015,15 +2079,16 @@ static void uether_debugfs_init(struct eth_dev *dev, const char *name)
 				uether_dent, dev, &uether_stats_ops);
 	if (!uether_dfile || IS_ERR(uether_dfile))
 		debugfs_remove(uether_dent);
-	dev->uether_dfile = uether_dfile;
+
+	uether_dfile = debugfs_create_file("tx_bytes_rcvd", S_IRUGO | S_IWUSR,
+				uether_dent, dev, &uether_bytes_rcvd_ops);
+	if (!uether_dfile || IS_ERR(uether_dfile))
+		debugfs_remove_recursive(uether_dent);
 }
 
 static void uether_debugfs_exit(struct eth_dev *dev)
 {
-	debugfs_remove(dev->uether_dfile);
-	debugfs_remove(dev->uether_dent);
-	dev->uether_dent = NULL;
-	dev->uether_dfile = NULL;
+	debugfs_remove_recursive(dev->uether_dent);
 }
 
 static int __init gether_init(void)

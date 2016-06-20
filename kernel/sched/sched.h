@@ -756,7 +756,7 @@ extern unsigned int sched_downmigrate;
 extern unsigned int sched_init_task_load_pelt;
 extern unsigned int sched_init_task_load_windows;
 extern unsigned int sched_heavy_task;
-
+extern unsigned int up_down_migrate_scale_factor;
 extern void reset_cpu_hmp_stats(int cpu, int reset_cra);
 extern void fixup_nr_big_small_task(int cpu, int reset_stats);
 unsigned int max_task_load(void);
@@ -764,6 +764,7 @@ extern void sched_account_irqtime(int cpu, struct task_struct *curr,
 				 u64 delta, u64 wallclock);
 unsigned int cpu_temp(int cpu);
 extern unsigned int nr_eligible_big_tasks(int cpu);
+extern void update_up_down_migrate(void);
 
 /*
  * 'load' is in reference to "best cpu" at its best frequency.
@@ -952,6 +953,7 @@ extern void check_for_migration(struct rq *rq, struct task_struct *p);
 extern void pre_big_small_task_count_change(const struct cpumask *cpus);
 extern void post_big_small_task_count_change(const struct cpumask *cpus);
 extern void set_hmp_defaults(void);
+extern int power_delta_exceeded(unsigned int cpu_cost, unsigned int base_cost);
 extern unsigned int power_cost_at_freq(int cpu, unsigned int freq);
 extern void reset_all_window_stats(u64 window_start, unsigned int window_size);
 extern void boost_kick(int cpu);
@@ -1724,3 +1726,16 @@ static inline u64 irq_time_read(int cpu)
 }
 #endif /* CONFIG_64BIT */
 #endif /* CONFIG_IRQ_TIME_ACCOUNTING */
+
+static inline void account_reset_rq(struct rq *rq)
+{
+#ifdef CONFIG_IRQ_TIME_ACCOUNTING
+	rq->prev_irq_time = 0;
+#endif
+#ifdef CONFIG_PARAVIRT
+	rq->prev_steal_time = 0;
+#endif
+#ifdef CONFIG_PARAVIRT_TIME_ACCOUNTING
+	rq->prev_steal_time_rq = 0;
+#endif
+}

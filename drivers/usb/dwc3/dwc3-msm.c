@@ -145,6 +145,9 @@ MODULE_PARM_DESC(id_gnd_threshold, "Threshold for ID GND Voltage");
 #define DWC3_3P3_VOL_MIN		3075000 /* uV */
 #define DWC3_3P3_VOL_MAX		3200000 /* uV */
 #define DWC3_3P3_HPM_LOAD		30000	/* uA */
+#define DWC3_1P8_VOL_MIN		1800000 /* uV */
+#define DWC3_1P8_VOL_MAX		1800000 /* uV */
+#define DWC3_1P8_HPM_LOAD		30000   /* uA */
 
 /* TZ SCM parameters */
 #define DWC3_MSM_RESTORE_SCM_CFG_CMD 0x2
@@ -185,6 +188,7 @@ struct dwc3_msm {
 	/* VBUS regulator if no OTG and running in host only mode */
 	struct regulator	*vbus_otg;
 	struct regulator	*vdda33;
+	struct regulator	*vdda18;
 	struct dwc3_ext_xceiv	ext_xceiv;
 	bool			resume_pending;
 	atomic_t                pm_suspended;
@@ -1574,27 +1578,23 @@ static int dwc3_msm_prepare_suspend(struct dwc3_msm *mdwc)
 
 static void dwc3_msm_wake_interrupt_enable(struct dwc3_msm *mdwc, bool on)
 {
-	u32 irq_mask;
+	u32 irq_mask, irq_stat;
+	u32 wakeup_events = PWR_EVNT_POWERDOWN_OUT_P3_MASK |
+		PWR_EVNT_LPM_OUT_L2_MASK;
 
-	if (on) {
-		/* Enable P3 and L2 OUT events */
-		irq_mask = dwc3_msm_read_reg(mdwc->base, PWR_EVNT_IRQ_MASK_REG);
-		irq_mask |= PWR_EVNT_LPM_OUT_L2_MASK |
-				PWR_EVNT_POWERDOWN_OUT_P3_MASK;
-		dwc3_msm_write_reg(mdwc->base, PWR_EVNT_IRQ_MASK_REG, irq_mask);
-	} else {
-		static const u32 pwr_events = PWR_EVNT_POWERDOWN_OUT_P3_MASK |
-					      PWR_EVNT_LPM_OUT_L2_MASK;
+	irq_stat = dwc3_msm_read_reg(mdwc->base, PWR_EVNT_IRQ_STAT_REG);
 
-		/* Disable P3 and L2 OUT events */
-		irq_mask = dwc3_msm_read_reg(mdwc->base, PWR_EVNT_IRQ_MASK_REG);
-		irq_mask &= ~pwr_events;
-		dwc3_msm_write_reg(mdwc->base, PWR_EVNT_IRQ_MASK_REG, irq_mask);
+	/* clear pending interrupts */
+	dwc3_msm_write_reg(mdwc->base, PWR_EVNT_IRQ_STAT_REG, irq_stat);
 
-		/* Clear the P3 and L2 OUT status */
-		dwc3_msm_write_reg(mdwc->base, PWR_EVNT_IRQ_STAT_REG,
-				   pwr_events);
-	}
+	irq_mask = dwc3_msm_read_reg(mdwc->base, PWR_EVNT_IRQ_MASK_REG);
+
+	if (on) /* Enable P3 and L2 OUT events */
+		irq_mask |= wakeup_events;
+	else /* Disable P3 and L2 OUT events */
+		irq_mask &= ~wakeup_events;
+
+	dwc3_msm_write_reg(mdwc->base, PWR_EVNT_IRQ_MASK_REG, irq_mask);
 }
 
 static int dwc3_msm_suspend(struct dwc3_msm *mdwc)
@@ -1725,15 +1725,10 @@ static int dwc3_msm_suspend(struct dwc3_msm *mdwc)
 
 	/* Enable wakeup from LPM */
 	if (mdwc->pwr_event_irq) {
+		disable_irq(mdwc->pwr_event_irq);
 		dwc3_msm_wake_interrupt_enable(mdwc, true);
 		enable_irq_wake(mdwc->pwr_event_irq);
 	}
-
-	/*
-	 * Marking in LPM before disabling the clocks in order to avoid a
-	 * potential race condition with pwr_event_irq.
-	 */
-	atomic_set(&dwc->in_lpm, 1);
 
 	usb_phy_set_suspend(mdwc->hs_phy, 1);
 
@@ -1798,6 +1793,10 @@ static int dwc3_msm_suspend(struct dwc3_msm *mdwc)
 			mdwc->lpm_flags |= MDWC3_ASYNC_IRQ_WAKE_CAPABILITY;
 		}
 	}
+
+	atomic_set(&dwc->in_lpm, 1);
+	if (mdwc->pwr_event_irq)
+		enable_irq(mdwc->pwr_event_irq);
 
 	dev_info(mdwc->dev, "DWC3 in low power mode\n");
 	return 0;
@@ -1999,10 +1998,15 @@ static void dwc3_resume_work(struct work_struct *w)
 		return;
 	}
 
-	/* bail out if system resume in process, else initiate RESUME */
+	/*
+	 * if system resume in progress exit LPM first to meet resume timeline
+	 * from device side and let pm resume notify otg state machine about
+	 * resume event, else initiate RESUME here
+	 */
 	if (atomic_read(&mdwc->pm_suspended)) {
-		dbg_event(0xFF, "RWrk PMSus", 0);
+		dwc3_msm_resume(mdwc);
 		mdwc->resume_pending = true;
+		dbg_event(0xFF, "RWrk PMSus", 0);
 	} else {
 		dbg_event(0xFF, "RWrk !PMSus", mdwc->otg_xceiv ? 1 : 0);
 		pm_runtime_get_sync(mdwc->dev);
@@ -2269,6 +2273,7 @@ static irqreturn_t msm_dwc3_pwr_irq(int irq, void *data)
 	struct dwc3_msm *mdwc = data;
 	struct dwc3 *dwc = platform_get_drvdata(mdwc->dwc3);
 
+	dwc->t_pwr_evt_irq = ktime_get();
 	dev_dbg(mdwc->dev, "%s received\n", __func__);
 	/*
 	 * When in Low Power Mode, can't read PWR_EVNT_IRQ_STAT_REG to acertain
@@ -2277,13 +2282,11 @@ static irqreturn_t msm_dwc3_pwr_irq(int irq, void *data)
 	 * dwc3_pwr_event_handler to handle all other power events
 	 */
 	if (atomic_read(&dwc->in_lpm)) {
-		/* Initate resume if system resume is not in process */
-		if (!atomic_read(&mdwc->pm_suspended))
-				return IRQ_WAKE_THREAD;
+		if (atomic_read(&mdwc->pm_suspended))
+			mdwc->resume_pending = true;
 
-		mdwc->resume_pending = true;
-
-		return IRQ_HANDLED;
+		/* Initate controller resume */
+		return IRQ_WAKE_THREAD;
 	}
 
 	dwc3_pwr_event_handler(mdwc);
@@ -2297,10 +2300,30 @@ static int dwc3_msm_remove_pulldown(struct dwc3_msm *mdwc, bool rm_pulldown)
 	if (!rm_pulldown)
 		goto disable_vdda33;
 
+	ret = regulator_set_optimum_mode(mdwc->vdda18, DWC3_1P8_HPM_LOAD);
+	if (ret < 0) {
+		dev_err(mdwc->dev, "Unable to set HPM of vdda18:%d\n", ret);
+		return ret;
+	}
+
+	ret = regulator_set_voltage(mdwc->vdda18, DWC3_1P8_VOL_MIN,
+						DWC3_1P8_VOL_MAX);
+	if (ret) {
+		dev_err(mdwc->dev,
+				"Unable to set voltage for vdda18:%d\n", ret);
+		goto put_vdda18_lpm;
+	}
+
+	ret = regulator_enable(mdwc->vdda18);
+	if (ret) {
+		dev_err(mdwc->dev, "Unable to enable vdda18:%d\n", ret);
+		goto unset_vdda18;
+	}
+
 	ret = regulator_set_optimum_mode(mdwc->vdda33, DWC3_3P3_HPM_LOAD);
 	if (ret < 0) {
 		dev_err(mdwc->dev, "Unable to set HPM of vdda33:%d\n", ret);
-		return ret;
+		goto disable_vdda18;
 	}
 
 	ret = regulator_set_voltage(mdwc->vdda33, DWC3_3P3_VOL_MIN,
@@ -2334,6 +2357,22 @@ put_vdda33_lpm:
 	ret = regulator_set_optimum_mode(mdwc->vdda33, 0);
 	if (ret < 0)
 		dev_err(mdwc->dev, "Unable to set (0) HPM of vdda33\n");
+
+disable_vdda18:
+	ret = regulator_disable(mdwc->vdda18);
+	if (ret)
+		dev_err(mdwc->dev, "Unable to disable vdda18:%d\n", ret);
+
+unset_vdda18:
+	ret = regulator_set_voltage(mdwc->vdda18, 0, DWC3_1P8_VOL_MAX);
+	if (ret)
+		dev_err(mdwc->dev,
+			"Unable to set (0) voltage for vdda18:%d\n", ret);
+
+put_vdda18_lpm:
+	ret = regulator_set_optimum_mode(mdwc->vdda18, 0);
+	if (ret < 0)
+		dev_err(mdwc->dev, "Unable to set LPM of vdda18\n");
 
 	return ret;
 }
@@ -3111,6 +3150,12 @@ static int dwc3_msm_probe(struct platform_device *pdev)
 		return PTR_ERR(mdwc->vdda33);
 	}
 
+	mdwc->vdda18 = devm_regulator_get(dev, "vdda18");
+	if (IS_ERR(mdwc->vdda18)) {
+		dev_err(&pdev->dev, "unable to get vdda18 supply\n");
+		return PTR_ERR(mdwc->vdda18);
+	}
+
 	ret = dwc3_msm_config_gdsc(mdwc, 1);
 	if (ret) {
 		dev_err(&pdev->dev, "unable to configure usb3 gdsc\n");
@@ -3273,10 +3318,14 @@ static int dwc3_msm_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "pget_irq for pwr_event_irq failed\n");
 		goto disable_ref_clk;
 	} else {
+		/*
+		 * enable pwr event irq early during PM resume to meet bus
+		 * resume timeline from usb device
+		 */
 		ret = devm_request_threaded_irq(&pdev->dev, mdwc->pwr_event_irq,
 					msm_dwc3_pwr_irq,
 					msm_dwc3_pwr_irq_thread,
-					IRQF_TRIGGER_RISING,
+					IRQF_TRIGGER_RISING | IRQF_EARLY_RESUME,
 					"msm_dwc3", mdwc);
 		if (ret) {
 			dev_err(&pdev->dev, "irqreq pwr_event_irq failed: %d\n",
@@ -3748,7 +3797,6 @@ static int dwc3_msm_pm_suspend(struct device *dev)
 
 static int dwc3_msm_pm_resume(struct device *dev)
 {
-	int ret = 0;
 	struct dwc3_msm *mdwc = dev_get_drvdata(dev);
 	struct dwc3 *dwc = platform_get_drvdata(mdwc->dwc3);
 
@@ -3758,8 +3806,6 @@ static int dwc3_msm_pm_resume(struct device *dev)
 	dbg_event(0xFF, "PM Res", mdwc->resume_pending);
 	if (mdwc->resume_pending) {
 		mdwc->resume_pending = false;
-
-		ret = dwc3_msm_resume(mdwc);
 
 		/* Update runtime PM status */
 		pm_runtime_disable(dev);
@@ -3778,7 +3824,7 @@ static int dwc3_msm_pm_resume(struct device *dev)
 		}
 	}
 
-	return ret;
+	return 0;
 }
 #endif
 

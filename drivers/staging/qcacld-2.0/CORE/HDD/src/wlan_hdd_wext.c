@@ -2533,7 +2533,7 @@ static int iw_set_bitrate(struct net_device *dev,
 static int __iw_set_genie(struct net_device *dev, struct iw_request_info *info,
 			  union iwreq_data *wrqu, char *extra)
 {
-   hdd_adapter_t *pAdapter = WLAN_HDD_GET_PRIV_PTR(dev);
+    hdd_adapter_t *pAdapter = WLAN_HDD_GET_PRIV_PTR(dev);
     hdd_wext_state_t *pWextState = WLAN_HDD_GET_WEXT_STATE_PTR(pAdapter);
     u_int8_t *genie = NULL;
     u_int8_t *base_genie = NULL;
@@ -10323,7 +10323,9 @@ int iw_set_two_ints_getnone(struct net_device *dev,
     int *value = (int *)extra;
     int sub_cmd = value[0];
     int ret = 0;
+#ifdef DEBUG
     hdd_context_t *hdd_ctx = WLAN_HDD_GET_CTX(pAdapter);
+#endif
 
     if ((WLAN_HDD_GET_CTX(pAdapter))->isLogpInProgress) {
         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_FATAL,
